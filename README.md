@@ -147,4 +147,6 @@ tutorial materials.
 ## 👨‍🏫 Instructor
 
 **Dario Righelli**  
+Department of Biology,
+Department of Statistical Sciences, 
 University of Padova

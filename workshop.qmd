@@ -1,0 +1,673 @@
+---
+title: "Single-Cell RNA-seq Analysis with Bioconductor"
+subtitle: "A hands-on workflow from quality control to cell-type annotation"
+author: "Dario Righelli"
+format:
+  html:
+    theme: cosmo
+    css: styles.css
+    toc: true
+    toc-location: left
+    toc-title: "Contents"
+    toc-depth: 3
+    smooth-scroll: true
+    code-copy: true
+    code-overflow: wrap
+    anchor-sections: true
+    fig-align: center
+    link-external-newwindow: true
+execute:
+  freeze: false
+---
+
+
+```{r}
+#| label: setup
+#| include: false
+
+knitr::opts_chunk$set(
+  echo = TRUE,
+  warning = FALSE,
+  message = FALSE,
+  fig.align = "center",
+  out.width = "100%"
+)
+ 
+set.seed(123)
+
+library(BiocStyle)
+library(SingleCellExperiment)
+library(scuttle)
+library(scater)
+library(scran)
+library(bluster)
+library(patchwork)
+```
+
+# Introduction
+
+This hands-on workshop walks through a compact but complete single-cell RNA-seq
+analysis using the Bioconductor ecosystem. The emphasis is on **how the pieces
+fit together in practice**: we start from a `SingleCellExperiment`, progressively
+add analysis results to the same object, and finish with biologically interpretable
+cell-type labels.
+
+The statistical and biological foundations of the individual methods are covered
+in the accompanying theoretical session. Here, the goal is to build and inspect
+a working analysis pipeline.
+
+::: {.callout-tip title="Workflow at a glance"}
+**Data → quality control → normalization → feature selection → PCA → UMAP →
+clustering → marker genes → cell-type annotation**
+:::
+
+By the end of the session, you should be able to:
+
+- navigate a `SingleCellExperiment`;
+- compute and inspect basic QC metrics;
+- normalize counts and select highly variable genes;
+- generate PCA and UMAP representations;
+- identify graph-based clusters and their marker genes;
+- annotate cells using an external reference with `SingleR`.
+
+# 1. Loading the data
+
+We use the wild-type chimera dataset distributed with
+`MouseGastrulationData`. It contains mouse gastrulation cells with count data
+and rich cell-level metadata, while remaining small enough to run interactively
+during a workshop.
+
+```{r}
+#| label: load-data
+
+library(MouseGastrulationData)
+
+sce <- WTChimeraData(
+  samples = 5,
+  type = "processed"
+)
+```
+
+The object contains **2,411 cells and 29,453 features**. The original count
+matrix is available in the `counts` assay, and the supplied metadata include
+sample information and mapped cell-type annotations.
+
+```{r}
+#| label: inspect-sce
+
+sce
+```
+
+::: {.callout-note title="What should we notice?"}
+At this stage the object already contains the raw count matrix and metadata, but
+it does **not** yet contain the `logcounts`, PCA, UMAP, clustering or annotation
+results that we will generate below. The analysis will progressively enrich this
+same object rather than creating disconnected data structures.
+:::
+
+# 2. The `SingleCellExperiment` object
+
+`SingleCellExperiment` is the central container used by many Bioconductor
+single-cell packages. It keeps expression matrices, feature annotations,
+cell-level metadata and low-dimensional representations synchronized.
+
+![Structure of a `SingleCellExperiment` object, showing the main assays, row- and column-level metadata, and reduced-dimensional representations.](https://bioconductor.org/books/3.13/OSCA.intro/images/SingleCellExperiment.png){#fig-sce width=80% fig-align="center"}
+
+
+The expression matrix forms the core of the object, while feature and cell
+annotations are stored alongside it. Results generated during the analysis,
+such as PCA or UMAP coordinates, can be added to the same object without
+breaking the correspondence between genes and cells.
+
+## Assays and annotations
+
+The most important components for this workshop are:
+
+- `assays`: matrices such as raw counts and normalized expression;
+- `rowData`: feature-level annotations;
+- `colData`: cell-level annotations and QC metrics;
+- `reducedDims`: PCA, UMAP and other low-dimensional representations.
+
+```{r}
+#| label: sce-slots
+
+assayNames(sce)
+
+counts(sce)[1:5, 1:5]
+
+colData(sce)
+
+rowData(sce)
+
+reducedDims(sce)
+```
+
+::: {.callout-note title="Interpretation"}
+The count matrix is sparse, which is expected for scRNA-seq data. Feature names
+are Ensembl gene identifiers, while `rowData(sce)$SYMBOL` stores gene symbols.
+The cell metadata already contain experimental information and previously mapped
+annotations. We will leave those existing annotations and PCAs untouched and create our
+own downstream results.
+:::
+
+# 3. Quality control
+
+Quality control aims to identify cells whose expression profiles are dominated
+by technical problems rather than meaningful biology. We focus on three standard
+per-cell summaries:
+
+- **library size**: total number of counts per cell;
+- **detected features**: number of genes with non-zero counts;
+- **mitochondrial percentage**: fraction of counts assigned to mitochondrial genes.
+
+## Identifying mitochondrial genes
+
+The matrix uses Ensembl gene IDs, so we map them to chromosome names using
+`EnsDb.Mmusculus.v79`. Genes annotated on chromosome `MT` are flagged as
+mitochondrial.
+
+```{r}
+#| label: identify-mito
+
+library(EnsDb.Mmusculus.v79)
+library(AnnotationDbi)
+
+chr.loc <- mapIds(
+  EnsDb.Mmusculus.v79,
+  keys = rownames(sce),
+  keytype = "GENEID",
+  column = "SEQNAME",
+  multiVals = "first"
+)
+
+is.mito <- chr.loc == "MT"
+is.mito[is.na(is.mito)] <- FALSE
+
+table(is.mito)
+```
+
+In this dataset, 13 features are identified as mitochondrial genes.
+
+## Computing QC metrics
+
+```{r}
+#| label: qc-metrics
+
+qc <- perCellQCMetrics(
+  sce,
+  subsets = list(Mito = is.mito)
+)
+
+colData(sce) <- cbind(colData(sce), qc)
+```
+
+We first inspect each metric separately before deciding which cells to remove.
+
+```{r}
+#| label: qc-distributions
+#| fig-cap: "Distributions of library size, detected features and mitochondrial percentage across cells."
+#| fig-width: 11
+#| fig-height: 3.6
+
+(
+  plotColData(sce, y = "sum") |
+  plotColData(sce, y = "detected") |
+  plotColData(sce, y = "subsets_Mito_percent")
+) +
+  plot_layout(guides = "collect")
+```
+
+::: {.callout-note title="How to read these plots"}
+Library size and the number of detected genes are related measures of sequencing
+depth and complexity. Cells at the extreme low end of either distribution are
+potentially low quality. A high mitochondrial percentage can indicate damaged
+cells in which cytoplasmic RNA has been preferentially lost. The aim is not to
+maximize filtering, but to identify clear outliers.
+:::
+
+## Defining low-quality cells
+
+We use data-adaptive thresholds rather than arbitrary fixed cut-offs.
+
+```{r}
+#| label: qc-filter
+
+qc.filter <- perCellQCFilters(
+  qc,
+  sub.fields = "subsets_Mito_percent"
+)
+
+table(qc.filter$discard)
+
+sce$discard <- qc.filter$discard
+```
+
+The automatic filtering marks **87 of 2,411 cells** for removal, leaving
+**2,324 cells** for downstream analysis.
+
+We can now highlight the discarded cells on the individual QC distributions.
+
+```{r}
+#| label: qc-filtered-distributions
+#| fig-cap: "QC distributions with cells flagged for removal highlighted."
+#| fig-width: 11
+#| fig-height: 3.6
+
+(
+  plotColData(sce, y = "sum", colour_by = "discard") |
+  plotColData(sce, y = "detected", colour_by = "discard") |
+  plotColData(sce, y = "subsets_Mito_percent", colour_by = "discard")
+) +
+  plot_layout(guides = "collect")
+```
+
+::: {.callout-note title="Interpretation"}
+The highlighted cells let us check whether the automatic rule is targeting
+extreme observations rather than removing a large central portion of the data.
+This visual check is important: QC thresholds should always be treated as a
+diagnostic decision, not as an unquestioned preprocessing recipe.
+:::
+
+A bivariate view is especially useful because it shows whether cells with high
+mitochondrial content also occupy unusual regions of the library-size
+distribution.
+
+```{r}
+#| label: qc-diagnostic
+#| fig-cap: "Library size versus mitochondrial percentage, highlighting cells selected for removal."
+#| fig-width: 7
+#| fig-height: 5
+
+plotColData(
+  sce,
+  x = "sum",
+  y = "subsets_Mito_percent",
+  colour_by = "discard"
+)
+```
+
+::: {.callout-note title="Interpretation"}
+The joint plot helps detect problematic cells that may not look extreme when
+each QC metric is considered in isolation. Once we are satisfied that the
+flagged cells represent QC outliers, we remove them.
+:::
+
+```{r}
+#| label: qc-subset
+
+sce <- sce[, !sce$discard]
+```
+
+# 4. Normalization
+
+Cells can differ substantially in sequencing depth and capture efficiency.
+Normalization places expression values on a comparable scale before we measure
+transcriptional similarity.
+
+Here we use `logNormCounts()`, which computes normalized log-expression values
+and stores them directly in a new `logcounts` assay.
+
+```{r}
+#| label: normalization
+
+sce <- logNormCounts(sce)
+
+assayNames(sce)
+```
+
+The `SingleCellExperiment` now contains both the original counts and normalized
+expression values.
+
+```{r}
+#| label: inspect-logcounts
+
+logcounts(sce)[10:15, 10:15]
+```
+
+::: {.callout-note title="What changed?"}
+Normalization does not replace the raw counts. Instead, `logcounts` is added as
+a second assay, so downstream methods can use normalized expression while the
+original data remain available in the same object.
+:::
+
+# 5. Feature selection
+
+Not every detected gene is informative for distinguishing cell states. Many
+genes show little biological variation or mostly contribute technical noise.
+
+We model the mean–variance relationship and quantify the biological component
+of variability for each gene.
+
+```{r}
+#| label: feature-selection
+
+dec <- modelGeneVar(sce)
+
+dec
+```
+
+We retain the 1,000 most highly variable genes for dimensionality reduction.
+
+```{r}
+#| label: hvg
+
+hvg <- getTopHVGs(dec, n = 1000)
+
+length(hvg)
+head(hvg)
+```
+
+::: {.callout-note title="Why select HVGs?"}
+PCA and clustering work best when the input emphasizes genes that vary
+meaningfully between cells. Restricting the analysis to highly variable genes
+also reduces noise and computational cost without discarding the original
+expression matrix.
+:::
+
+# 6. Principal component analysis
+
+PCA compresses the expression profiles of the selected HVGs into a smaller set
+of orthogonal components. This denoised representation is used as the basis for
+neighbour finding and clustering.
+
+```{r}
+#| label: pca
+
+sce <- runPCA(
+  sce,
+  subset_row = hvg
+)
+
+reducedDims(sce)
+```
+
+```{r}
+#| label: pca-plot
+#| fig-cap: "Cells projected onto the first two principal components."
+#| fig-width: 7
+#| fig-height: 5
+
+plotReducedDim(
+  sce,
+  dimred = "PCA"
+)
+```
+
+::: {.callout-note title="Interpretation"}
+The PCA projection already reveals broad transcriptional structure, but the
+first two components represent only part of the total variation. For downstream
+analysis we retain the multidimensional PCA representation rather than relying
+only on what is visible in this two-dimensional plot.
+:::
+
+# 7. UMAP
+
+UMAP provides a two-dimensional visualization that emphasizes local
+neighbourhood structure. We compute it from the PCA coordinates rather than
+directly from the full expression matrix.
+
+```{r}
+#| label: umap
+#| fig-cap: "UMAP representation computed from the PCA space."
+#| fig-width: 7
+#| fig-height: 5
+
+sce <- runUMAP(
+  sce,
+  dimred = "PCA"
+)
+
+plotReducedDim(
+  sce,
+  dimred = "UMAP"
+)
+```
+
+::: {.callout-note title="Interpretation"}
+The UMAP separates the dataset into several compact regions and trajectories,
+suggesting substantial cellular heterogeneity. At this point the visualization
+is deliberately unlabelled: the next step asks whether graph-based clustering
+recovers coherent groups within this structure.
+:::
+
+# 8. Clustering
+
+We identify groups of transcriptionally similar cells using graph-based
+clustering. A nearest-neighbour graph is constructed in PCA space and communities
+are detected with the Louvain algorithm.
+
+```{r}
+#| label: clustering
+
+colLabels(sce) <- clusterCells(
+  sce,
+  use.dimred = "PCA",
+  BLUSPARAM = NNGraphParam(
+    cluster.fun = "louvain"
+  )
+)
+
+table(colLabels(sce))
+```
+
+The procedure identifies **15 clusters**, with sizes ranging from small rare
+groups to several hundred cells.
+
+```{r}
+#| label: clustering-plot
+#| fig-cap: "UMAP coloured by Louvain cluster assignment."
+#| fig-width: 8
+#| fig-height: 5.5
+
+plotReducedDim(
+  sce,
+  dimred = "UMAP",
+  colour_by = "label"
+)
+```
+
+::: {.callout-note title="Interpretation"}
+The cluster colouring provides a discrete summary of the continuous UMAP
+structure. Well-separated UMAP regions should generally correspond to individual
+or closely related clusters, while neighbouring clusters may represent finer
+substructure within related developmental states. Clusters are computational
+groups at this stage; they are **not yet biological cell types**.
+:::
+
+# 9. Marker genes
+
+Marker detection connects the unsupervised clusters to gene-level biology. We
+search for genes that are up-regulated in each cluster relative to the others.
+
+```{r}
+#| label: markers
+
+markers <- findMarkers(
+  sce,
+  groups = colLabels(sce),
+  direction = "up"
+)
+
+markers
+```
+
+`markers` is a list with one table per cluster. Each table summarizes pairwise
+comparisons against the remaining clusters and ranks genes according to their
+ability to distinguish that cluster.
+
+```{r}
+#| label: markers-first
+
+head(markers[[1]])
+```
+
+::: {.callout-note title="Reading the marker table"}
+`Top` summarizes the best rank achieved across pairwise comparisons, while
+`p.value` and `FDR` quantify statistical evidence. The `logFC.*` columns show
+the direction and magnitude of expression differences against individual
+clusters. In practice, we would combine these statistics with known biological
+markers rather than assigning cell identities from significance alone.
+:::
+
+# 10. Cell-type annotation
+
+Manual annotation based on marker genes is valuable but can be time-consuming
+and subjective. As a complementary approach, we compare each query cell with an
+independently annotated embryonic reference using `SingleR`.
+
+## Preparing the reference
+
+We use `EmbryoAtlasData()` from the same data package. Cells without a reference
+label are removed, as are cell types represented by fewer than 10 cells.
+
+```{r}
+#| label: annotation-setup
+
+library(MouseGastrulationData)
+
+ref <- EmbryoAtlasData(samples = 29)
+ref <- ref[, !is.na(ref$celltype)]
+
+tab <- table(ref$celltype)
+keep.types <- names(tab)[tab >= 10]
+ref <- ref[, ref$celltype %in% keep.types]
+
+ref <- logNormCounts(ref)
+
+ref
+table(ref$celltype)
+```
+
+The filtered reference contains **6,453 cells** spanning **25 embryonic cell
+types**, providing a biologically appropriate label space for the query cells.
+
+## Running `SingleR`
+
+`SingleR` compares each query profile with the labelled reference. We aggregate
+reference cells within labels to keep the workshop computation fast.
+
+```{r}
+#| label: annotation
+
+library(SingleR)
+
+pred <- SingleR(
+  test = sce,
+  ref = ref,
+  labels = ref$celltype,
+  de.method = "wilcox",
+  aggr.ref = TRUE
+)
+
+table(pred$labels)
+```
+
+The predictions cover a broad range of developmental lineages rather than
+collapsing most cells into one or two dominant labels, which is a useful first
+sanity check for this heterogeneous dataset.
+
+```{r}
+#| label: annotation-store
+
+sce$cell_type <- pred$labels
+```
+
+## Visualizing predicted cell types
+
+With many nominal categories, a continuous colour scale is inappropriate. We
+therefore generate a qualitative palette designed to keep neighbouring labels
+visually distinct.
+
+```{r}
+#| label: annotation-plot
+#| fig-cap: "UMAP coloured by SingleR-predicted cell type."
+#| fig-width: 11
+#| fig-height: 6.5
+
+library(Polychrome)
+
+cell_types <- sort(unique(sce$cell_type))
+
+cols <- createPalette(
+  length(cell_types),
+  seedcolors = c("#E41A1C", "#377EB8", "#4DAF4A")
+)
+
+names(cols) <- cell_types
+
+plotReducedDim(
+  sce,
+  dimred = "UMAP",
+  colour_by = "cell_type"
+) +
+  scale_colour_manual(values = cols) +
+  guides(
+    colour = guide_legend(
+      title = "Cell type",
+      override.aes = list(size = 3)
+    )
+  ) +
+  theme(
+    legend.position = "right",
+    legend.key.height = grid::unit(0.45, "cm")
+  )
+```
+
+::: {.callout-note title="Interpretation"}
+The predicted labels occupy distinct regions of the UMAP and recover a diverse
+set of embryonic lineages, including mesodermal, erythroid, endothelial,
+neural and endodermal populations. Some related labels remain close to one
+another, which is expected for developmental states connected by gradual
+transcriptional transitions. Automated labels should therefore be treated as
+evidence to combine with marker genes and biological knowledge, not as ground
+truth.
+:::
+
+# 11. Putting everything together
+
+At the end of the workflow, the same `SingleCellExperiment` contains the raw and
+normalized expression matrices, QC information, low-dimensional embeddings,
+cluster assignments and predicted cell types.
+
+```{r}
+#| label: final-object
+
+sce
+
+assayNames(sce)
+
+reducedDims(sce)
+
+colData(sce)
+```
+
+::: {.callout-important title="The key Bioconductor idea"}
+The object has travelled through the entire analysis:
+
+**counts → QC → log-normalization → HVGs → PCA → UMAP → clustering → markers →
+cell-type annotation**
+
+Each step adds information while preserving the existing data and metadata in a
+common, interoperable container.
+:::
+
+# Take-home messages
+
+- `SingleCellExperiment` provides a common data structure across the workflow.
+- QC decisions should be inspected visually rather than applied blindly.
+- Normalization and feature selection prepare the data for similarity-based analyses.
+- PCA provides a denoised working space; UMAP provides an intuitive visualization.
+- Clusters summarize transcriptional structure but do not automatically define cell types.
+- Marker genes and reference-based annotation provide complementary biological evidence.
+- Bioconductor packages interoperate by adding results back to the same object.
+
+# Session information
+
+For reproducibility, the exact R and package versions used to render the workshop
+are reported below.
+
+```{r}
+#| label: session-info
+
+sessionInfo()
+```
