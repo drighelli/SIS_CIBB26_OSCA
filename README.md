@@ -4,7 +4,8 @@ You can retrieve the slides of dott. Andrea Sottosanti from the following link:
 
 https://drive.google.com/file/d/1g60Cib-oNixMayRfblgVi8gDcKlyMLF8/view?usp=sharing
 
-# 🧬 Single-Cell RNA-seq Analysis with Bioconductor
+
+# 🧬 Part 2 - Single-Cell RNA-seq Analysis with Bioconductor
 
 <p align="left">
   <img src="https://img.shields.io/badge/Bioconductor-single--cell-2C7FB8?style=for-the-badge" alt="Bioconductor">
