@@ -1,3 +1,9 @@
+# Part 1 - slides
+
+You can retrieve the slides of dott. Andrea Sottosanti from the following link:
+
+https://drive.google.com/file/d/1g60Cib-oNixMayRfblgVi8gDcKlyMLF8/view?usp=sharing
+
 # 🧬 Single-Cell RNA-seq Analysis with Bioconductor
 
 <p align="left">
