@@ -35,6 +35,7 @@ knitr::opts_chunk$set(
  
 set.seed(123)
 
+library(MouseGastrulationData)
 library(BiocStyle)
 library(SingleCellExperiment)
 library(scuttle)
