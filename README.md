@@ -45,6 +45,10 @@ accompanying theoretical session.
 **Total: 90 minutes**
 
 ---
+## 📦 Install required packages
+
+To install all required packages, run the provided installation script in R with `source("install_workshop_packages.R")`.
+
 
 ## 🐭 Dataset
 
